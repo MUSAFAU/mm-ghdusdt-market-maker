@@ -1,0 +1,136 @@
+openapi: 3.0.3
+info:
+  title: Mock Exchange API With HMAC Auth
+  version: 1.1.0
+servers:
+  - url: http://localhost:9000
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
+    ApiTimestamp:
+      type: apiKey
+      in: header
+      name: X-TIMESTAMP
+    ApiSignature:
+      type: apiKey
+      in: header
+      name: X-SIGNATURE
+security:
+  - ApiKeyAuth: []
+    ApiTimestamp: []
+    ApiSignature: []
+paths:
+  /account/balance:
+    get:
+      summary: Get account balances
+      description: |
+        Requires HMAC-SHA256 signature.
+
+        **Message Format**
+        `<timestamp>GET/account/balance`
+
+        **Signature**
+        `HMAC_SHA256(secret_key, message)`
+      responses:
+        '200':
+          description: Balances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  balances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        asset:
+                          type: string
+                        free:
+                          type: number
+                        locked:
+                          type: number
+  /orders:
+    post:
+      summary: Place limit order
+      description: |
+        Requires HMAC-SHA256 signature.
+
+        **Message Format**
+        `<timestamp>POST/orders{"symbol":"GHDUSDT","side":"BUY","price":0.1,"quantity":100}`
+
+        **Signature**
+        `HMAC_SHA256(secret_key, message)`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [symbol, side, price, quantity, timeInForce]
+              properties:
+                symbol:
+                  type: string
+                side:
+                  type: string
+                  enum: [BUY, SELL]
+                price:
+                  type: number
+                quantity:
+                  type: number
+                timeInForce:
+                  type: string
+                  enum: [GTC, IOC, FOK]
+      responses:
+        '201':
+          description: Order accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+  /orders/{orderId}:
+    delete:
+      summary: Cancel an order
+      description: |
+        Requires HMAC-SHA256 signature.
+
+        **Message Format**
+        `<timestamp>DELETE/orders/{orderId}`
+
+        **Signature**
+        `HMAC_SHA256(secret_key, message)`
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Order cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+components:
+  schemas:
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+        symbol:
+          type: string
+        side:
+          type: string
+        price:
+          type: number
+        quantity:
+          type: number
+        executedQuantity:
+          type: number
+        status:
+          type: string

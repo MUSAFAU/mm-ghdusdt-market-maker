@@ -1,0 +1,24 @@
+version: '3.8'
+services:
+  mock:
+    build: ./mock-exchange
+    ports:
+      - "9000:9000"
+  bot:
+    build: ./bot
+    environment:
+      - API_KEY=testkey
+      - API_SECRET=testsecret
+      - API_BASE=http://mock:9000
+      - WS_URL=ws://mock:9000/ws
+    depends_on:
+      - mock
+  swagger:
+    image: python:3.11-slim
+    volumes:
+      - ./swagger-ui:/usr/src/app
+      - ./openapi:/usr/src/app/openapi
+    working_dir: /usr/src/app
+    command: python3 -m http.server 8080
+    ports:
+      - "8080:8080"
