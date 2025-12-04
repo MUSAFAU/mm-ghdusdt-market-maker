@@ -5,6 +5,8 @@ import aiohttp
 import json
 import time
 import math
+import hmac
+import hashlib
 from collections import deque
 from decimal import Decimal, ROUND_DOWN
 from dotenv import load_dotenv
@@ -13,6 +15,7 @@ import signal
 load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")  # ADD THIS LINE
 API_BASE = os.getenv("API_BASE", "http://localhost:9000")
 WS_URL = os.getenv("WS_URL", "ws://localhost:9000/ws")
 SYMBOL = os.getenv("SYMBOL", "GHDUSDT")
@@ -61,35 +64,74 @@ class MMBot:
         self.last_mid = None
         self.http_sem = asyncio.Semaphore(10)
         self.running = True
-
+        self.api_key = API_KEY
+        self.api_secret = API_SECRET  # Store the secret
+    
+    def generate_signature(self, timestamp, method, path, body=""):
+        """Generate HMAC SHA256 signature"""
+        message = f"{timestamp}{method}{path}{body}"
+        secret = self.api_secret.encode()
+        signature = hmac.new(secret, message.encode(), hashlib.sha256).hexdigest()
+        return signature
+    
     async def rest_post(self, path, payload):
         url = API_BASE.rstrip("/") + path
-        headers = {"X-API-KEY": API_KEY, "Content-Type": "application/json"}
+        timestamp = str(int(time.time() * 1000))  # milliseconds
+        body = json.dumps(payload) if payload else ""
+        
+        # Generate signature
+        signature = self.generate_signature(timestamp, "POST", path, body)
+        
+        headers = {
+            "X-API-KEY": self.api_key,
+            "X-TIMESTAMP": timestamp,
+            "X-SIGNATURE": signature,
+            "Content-Type": "application/json"
+        }
+        
+        print(f"DEBUG POST: {path}, timestamp: {timestamp}, sig: {signature[:10]}...")
+        
         async with self.http_sem:
             async with self.session.post(url, json=payload, headers=headers, timeout=10) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
                     raise Exception(f"POST {url} -> {resp.status}: {text}")
                 return await resp.json()
-
+    
     async def rest_delete(self, path):
         url = API_BASE.rstrip("/") + path
-        headers = {"X-API-KEY": API_KEY}
+        timestamp = str(int(time.time() * 1000))
+        body = ""
+        
+        # Generate signature
+        signature = self.generate_signature(timestamp, "DELETE", path, body)
+        
+        headers = {
+            "X-API-KEY": self.api_key,
+            "X-TIMESTAMP": timestamp,
+            "X-SIGNATURE": signature
+        }
+        
+        print(f"DEBUG DELETE: {path}, timestamp: {timestamp}, sig: {signature[:10]}...")
+        
         async with self.http_sem:
             async with self.session.delete(url, headers=headers, timeout=10) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise Exception(f"DELETE {url} -> {resp.status}: {text}")
                 return await resp.json()
-
+    
     async def on_trade(self, trade):
         ts = trade["ts"]
         qty = float(trade["quantity"])
         price = float(trade["price"])
         self.volume.add_trade(ts, qty, price)
-
+    
     async def on_orderbook(self, ob):
         best_bid = float(ob["bestBid"])
         best_ask = float(ob["bestAsk"])
         self.last_mid = (best_bid + best_ask) / 2.0
-
+    
     async def place_limit(self, side, price, qty):
         price = round_price(price)
         qty = round_qty(qty)
@@ -104,11 +146,12 @@ class MMBot:
         }
         try:
             res = await self.rest_post("/orders", payload)
+            print(f"Order placed: {res}")
             return res
         except Exception as e:
             print("place_limit error:", e)
             return None
-
+    
     async def cancel_order(self, order_id):
         try:
             res = await self.rest_delete(f"/orders/{order_id}")
@@ -116,9 +159,10 @@ class MMBot:
         except Exception as e:
             print("cancel order error:", e)
             return None
-
+    
     async def compute_and_place(self):
         if self.last_mid is None:
+            print("Waiting for market data...")
             return
 
         market_vol = self.volume.total_volume()
@@ -162,20 +206,48 @@ class MMBot:
             r = await self.place_limit("sell", sell_price, sell_qty)
             if r and "id" in r:
                 self.order_ids[f"sell_{int(time.time())}"] = r["id"]
-
+    
     async def ws_consume(self):
         import websockets
-        async with websockets.connect(WS_URL, extra_headers=[("X-API-KEY", API_KEY)]) as ws:
-            subscribe = {"type": "subscribe", "symbol": SYMBOL, "channels": ["trades", "orderbook"]}
-            await ws.send(json.dumps(subscribe))
-            while self.running:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                if data.get("type") == "trade":
-                    await self.on_trade(data)
-                elif data.get("type") == "orderbook":
-                    await self.on_orderbook(data)
-
+        import urllib.parse
+        
+        # Add API key as query parameter instead of header
+        url_parts = list(urllib.parse.urlsplit(WS_URL))
+        query = dict(urllib.parse.parse_qsl(url_parts[3]))
+        query['api_key'] = self.api_key
+        url_parts[3] = urllib.parse.urlencode(query)
+        ws_url_with_key = urllib.parse.urlunsplit(url_parts)
+        
+        print(f"Connecting to WebSocket: {ws_url_with_key}")
+        
+        try:
+            async with websockets.connect(
+                ws_url_with_key,
+                ping_interval=30,
+                ping_timeout=30
+            ) as ws:
+                subscribe = {
+                    "type": "subscribe", 
+                    "symbol": SYMBOL, 
+                    "channels": ["trades", "orderbook"]
+                }
+                await ws.send(json.dumps(subscribe))
+                print("WebSocket connected and subscribed")
+                
+                while self.running:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if data.get("type") == "trade":
+                        await self.on_trade(data)
+                    elif data.get("type") == "orderbook":
+                        await self.on_orderbook(data)
+                        
+        except Exception as e:
+            print(f"WebSocket error: {e}")
+            await asyncio.sleep(5)
+            if self.running:
+                await self.ws_consume()
+    
     async def bot_loop(self):
         while self.running:
             try:
@@ -185,6 +257,15 @@ class MMBot:
             await asyncio.sleep(ORDER_REFRESH_SECONDS)
 
 async def main():
+    # Debug: print environment variables
+    print("=== Bot Starting ===")
+    print(f"API_KEY: {API_KEY}")
+    print(f"API_SECRET: {'*' * len(API_SECRET) if API_SECRET else 'NOT SET'}")
+    print(f"API_BASE: {API_BASE}")
+    print(f"WS_URL: {WS_URL}")
+    print(f"SYMBOL: {SYMBOL}")
+    print("===================")
+    
     async with aiohttp.ClientSession() as sess:
         bot = MMBot(sess)
         ws_task = asyncio.create_task(bot.ws_consume())
